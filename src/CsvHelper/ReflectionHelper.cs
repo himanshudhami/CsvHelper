@@ -3,6 +3,7 @@
 // See LICENSE.txt for details or visit http://www.opensource.org/licenses/ms-pl.html for MS-PL and http://opensource.org/licenses/Apache-2.0 for Apache 2.0.
 // http://csvhelper.com
 using System;
+using System.Collections.Generic;
 #if !NET_2_0
 using System.Linq;
 using System.Linq.Expressions;
@@ -18,6 +19,8 @@ namespace CsvHelper
 	/// </summary>
 	internal static class ReflectionHelper
 	{
+		private static readonly Dictionary<int, Dictionary<Type, Delegate>> funcArgCache = new Dictionary<int, Dictionary<Type, Delegate>>();
+
 		/// <summary>
 		/// Creates an instance of type T.
 		/// </summary>
@@ -29,6 +32,7 @@ namespace CsvHelper
 #if NET_2_0
 			return Activator.CreateInstance<T>();
 #else
+
 			return (T)CreateInstance( typeof( T ), args );
 #endif
 		}
@@ -45,14 +49,21 @@ namespace CsvHelper
 			return Activator.CreateInstance( type, args );
 #else
 
-			var argumentTypes = args.Select( a => a.GetType() ).ToArray();
-			var argumentExpressions = argumentTypes.Select( ( t, i ) => Expression.Parameter( t, "var" + i ) ).ToArray();
-			var constructorInfo = type.GetConstructor( argumentTypes );
-			var constructor = Expression.New( constructorInfo, argumentExpressions );
-			var compiled = Expression.Lambda( constructor, argumentExpressions ).Compile();
+			Dictionary<Type, Delegate> funcCache;
+			if( !funcArgCache.TryGetValue( args.Length, out funcCache ) )
+			{
+				funcArgCache[args.Length] = funcCache = new Dictionary<Type, Delegate>();
+			}
+			
+			Delegate func;
+			if( !funcCache.TryGetValue( type, out func ) )
+			{
+				funcCache[type] = func = CreateInstanceDelegate( type, args );
+			}
+
 			try
 			{
-				return compiled.DynamicInvoke( args );
+				return func.DynamicInvoke( args );
 			}
 			catch( TargetInvocationException ex )
 			{
@@ -61,54 +72,37 @@ namespace CsvHelper
 #endif
 		}
 
+		private static T Default<T>()
+		{
+			return default( T );
+		}
+
 #if !NET_2_0
-		/// <summary>
-		/// Gets the first attribute of type T on property.
-		/// </summary>
-		/// <typeparam name="T">Type of attribute to get.</typeparam>
-		/// <param name="property">The <see cref="PropertyInfo" /> to get the attribute from.</param>
-		/// <param name="inherit">True to search inheritance tree, otherwise false.</param>
-		/// <returns>The first attribute of type T, otherwise null.</returns>
-		public static T GetAttribute<T>( PropertyInfo property, bool inherit ) where T : Attribute
+
+		private static Delegate CreateInstanceDelegate( Type type, params object[] args )
 		{
-			T attribute = null;
-			var attributes = property.GetCustomAttributes( typeof( T ), inherit ).ToList();
-			if( attributes.Count > 0 )
+			Delegate compiled;
+			if( type.GetTypeInfo().IsValueType )
 			{
-				attribute = attributes[0] as T;
+				var method = typeof( ReflectionHelper ).GetMethod( "Default", BindingFlags.Static | BindingFlags.NonPublic );
+				method = method.MakeGenericMethod( type );
+				compiled = Expression.Lambda( Expression.Call( method ) ).Compile();
 			}
-			return attribute;
-		}
-
-		/// <summary>
-		/// Gets the attributes of type T on property.
-		/// </summary>
-		/// <typeparam name="T">Type of attribute to get.</typeparam>
-		/// <param name="property">The <see cref="PropertyInfo" /> to get the attribute from.</param>
-		/// <param name="inherit">True to search inheritance tree, otherwise false.</param>
-		/// <returns>The attributes of type T.</returns>
-		public static T[] GetAttributes<T>( PropertyInfo property, bool inherit ) where T : Attribute
-		{
-			var attributes = property.GetCustomAttributes( typeof( T ), inherit );
-			return attributes.Cast<T>().ToArray();
-		}
-
-		/// <summary>
-		/// Gets the constructor <see cref="NewExpression"/> from the give <see cref="Expression"/>.
-		/// </summary>
-		/// <typeparam name="T">The <see cref="Type"/> of the object that will be constructed.</typeparam>
-		/// <param name="expression">The constructor <see cref="Expression"/>.</param>
-		/// <returns>A constructor <see cref="NewExpression"/>.</returns>
-		/// <exception cref="System.ArgumentException">Not a constructor expression.;expression</exception>
-		public static NewExpression GetConstructor<T>( Expression<Func<T>> expression )
-		{
-			var newExpression = expression.Body as NewExpression;
-			if( newExpression == null )
+			else
 			{
-				throw new ArgumentException( "Not a constructor expression.", "expression" );
+				var argumentTypes = args.Select( a => a.GetType() ).ToArray();
+				var argumentExpressions = argumentTypes.Select( ( t, i ) => Expression.Parameter( t, "var" + i ) ).ToArray();
+				var constructorInfo = type.GetConstructor( argumentTypes );
+				if( constructorInfo == null )
+				{
+					throw new InvalidOperationException( "No public parameterless constructor found." );
+				}
+
+				var constructor = Expression.New( constructorInfo, argumentExpressions );
+				compiled = Expression.Lambda( constructor, argumentExpressions ).Compile();
 			}
 
-			return newExpression;
+			return compiled;
 		}
 
 		/// <summary>
@@ -117,48 +111,71 @@ namespace CsvHelper
 		/// <typeparam name="TModel">The type of the model.</typeparam>
 		/// <param name="expression">The expression.</param>
 		/// <returns>The <see cref="PropertyInfo"/> for the expression.</returns>
-		public static PropertyInfo GetProperty<TModel>( Expression<Func<TModel, object>> expression )
+		public static MemberInfo GetMember<TModel>( Expression<Func<TModel, object>> expression )
 		{
-			var member = GetMemberExpression( expression ).Member;
+			var member = GetMemberExpression( expression.Body ).Member;
 			var property = member as PropertyInfo;
-			if( property == null )
+			if( property != null )
 			{
-				throw new CsvConfigurationException( string.Format( "'{0}' is not a property. Did you try to map a field by accident?", member.Name ) );
+				return property;
 			}
 
-			return property;
+			var field = member as FieldInfo;
+			if( field != null )
+			{
+				return field;
+			}
+
+			throw new CsvConfigurationException( $"'{member.Name}' is not a property/field." );
+		}
+
+		/// <summary>
+		/// Gets the property/field inheritance chain as a stack.
+		/// </summary>
+		/// <typeparam name="TModel">Type type of the model.</typeparam>
+		/// <param name="expression">The member expression.</param>
+		/// <returns>The inheritance chain for the given member expression as a stack.</returns>
+		public static Stack<MemberInfo> GetMembers<TModel>( Expression<Func<TModel, object>> expression )
+		{
+			var stack = new Stack<MemberInfo>();
+
+			var currentExpression = expression.Body;
+			while( true )
+			{
+				var memberExpression = GetMemberExpression( currentExpression );
+				if( memberExpression == null )
+				{
+					break;
+				}
+
+				stack.Push( memberExpression.Member );
+				currentExpression = memberExpression.Expression;
+			}
+
+			return stack;
 		}
 
 		/// <summary>
 		/// Gets the member expression.
 		/// </summary>
-		/// <typeparam name="TModel">The type of the model.</typeparam>
-		/// <typeparam name="T"></typeparam>
 		/// <param name="expression">The expression.</param>
 		/// <returns></returns>
-		private static MemberExpression GetMemberExpression<TModel, T>( Expression<Func<TModel, T>> expression )
+		private static MemberExpression GetMemberExpression( Expression expression )
 		{
-			// This method was taken from FluentNHibernate.Utils.ReflectionHelper.cs and modified.
-			// http://fluentnhibernate.org/
-
 			MemberExpression memberExpression = null;
-			if( expression.Body.NodeType == ExpressionType.Convert )
+			if( expression.NodeType == ExpressionType.Convert )
 			{
-				var body = (UnaryExpression)expression.Body;
+				var body = (UnaryExpression)expression;
 				memberExpression = body.Operand as MemberExpression;
 			}
-			else if( expression.Body.NodeType == ExpressionType.MemberAccess )
+			else if( expression.NodeType == ExpressionType.MemberAccess )
 			{
-				memberExpression = expression.Body as MemberExpression;
-			}
-
-			if( memberExpression == null )
-			{
-				throw new ArgumentException( "Not a member access", "expression" );
+				memberExpression = expression as MemberExpression;
 			}
 
 			return memberExpression;
 		}
+		
 #endif
 	}
 }
